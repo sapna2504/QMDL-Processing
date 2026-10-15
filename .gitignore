@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+scat_env/
+
+# Raw QMDL logs
+*.qmdl
+
+# Generated output
+*.csv
+*.png
+*.pdf
+
+# Temporary files
+*.tmp
+*.log
