@@ -1,8 +1,9 @@
-.PHONY: plot_qmdl plot_all_qmdl
+.PHONY: plot_all_qmdl
 
-DIR ?= plots
+DIR ?= ../data
 
-plot_qmdl: plot_all_qmdl
+all:
+	make plot_all_qmdl
 
 plot_all_qmdl:
 	@if [ -z "$(DIR)" ]; then \
@@ -22,18 +23,15 @@ plot_all_qmdl:
 		echo "=================================================="; \
 		qmdl_files=$$(ls "$$dir"/*.qmdl 2>/dev/null); \
 		if [ -n "$$qmdl_files" ]; then \
-			echo "Decoding QMDL logs with scat..."; \
-			scat -t qc -d $$qmdl_files > "$$dir/qmdl-to-scat.txt"; \
-			echo "Extracting diagnostic payload bytes..."; \
-			python3 $(MAKEFILE_DIR)qmdl_to_codes.py "$$dir/qmdl-to-scat.txt" "$$dir/payloads.txt"; \
-			pcap_file=$$(ls "$$dir"/*.pcap 2>/dev/null | head -n 1); \
-			if [ -f "$$pcap_file" ]; then \
-				echo "Plotting B881 correlation graph against PCAP: $$pcap_file..."; \
-				python3 $(MAKEFILE_DIR)b881_plotter.py "$$dir/payloads.txt" "$$pcap_file" "$$dir/b881_correlation_plot.png"; \
-			else \
-				echo "No .pcap file found in $$dir, skipping PCAP correlation plot."; \
+			if [ ! -f "$$dir/qmdl-to-scat.txt" ]; then \
+				echo "Decoding QMDL logs with scat..."; \
+				scat -t qc -d $$qmdl_files > "$$dir/qmdl-to-scat.txt"; \
 			fi; \
-			echo "Plotting box plot metrics..."; \
-			python3 $(MAKEFILE_DIR)b881_box_plotter.py "$$dir/payloads.txt" "$$dir/b881_box_plot.png"; \
+			if [ ! -f "$$dir/payloads.txt" ]; then \
+				echo "Extracting diagnostic payload bytes..."; \
+ 				python3 $(MAKEFILE_DIR)qmdl_to_codes.py "$$dir/qmdl-to-scat.txt" "$$dir/payloads.txt"; \
+			fi; \
+			echo "Creating metrics csv..."; \
+			python3 dump_readable_logs.py $$dir/payloads.txt; \
 		fi; \
 	done

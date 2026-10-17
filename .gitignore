@@ -15,3 +15,5 @@ scat_env/
 # Temporary files
 *.tmp
 *.log
+
+data
