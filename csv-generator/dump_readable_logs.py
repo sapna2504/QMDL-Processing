@@ -14,13 +14,21 @@ and writes two human-readable CSV files:
                                 frame, slot, pci, nr_arfcn, tb_size, mcs, num_rbs,
                                 harq_id, k1, rv, num_layers, scs
 
+  <output_prefix>_b139.csv   - one row per B139 LTE PUSCH Tx record, with timing,
+                                serving_cell_id, tb_size, num_rb, modulation, coding_rate,
+                                tx_power_dbm, retx_index, rv, and UCI fields
+
+  <output_prefix>_b173.csv   - one row per B173 LTE PDSCH Stat transport block, with
+                                frame, subframe, num_layers, tb_size, mcs, modulation,
+                                tb_rbs, harq_id, rv, ndi, crc_status, and rnti_type
+
 Usage:
     python3 dump_readable_logs.py <combined_payload.txt> [output_prefix]
 
 If output_prefix is omitted, it defaults to the payload filename without extension.
 
 This script independently decodes and calculates all metrics:
-  - Standalone multi-version B881 and B887 decoding (standard library only; no external dependencies).
+  - Standalone multi-version B881, B887, B139, and B173 decoding (standard library only; no external dependencies).
   - B881 cumulative counters and deltas are tracked independently per component carrier (CA).
   - Throughput (Mbps) is calculated using true elapsed time intervals (dt).
   - Reset and anomaly guards handle capture gaps, clock jumps, and counter wraps.
@@ -50,7 +58,56 @@ B887_HEADER = [
     "rv", "num_layers", "scs",
 ]
 
+B139_HEADER = [
+    "timestamp_epoch", "timestamp_utc", "serving_cell_id",
+    "dispatch_sfn", "dispatch_subfn", "current_sfn", "current_subfn",
+    "retx_index", "is_retx", "rv", "tb_size_bytes", "tb_size_bits",
+    "num_rb", "start_rb_slot0", "start_rb_slot1", "resource_alloc_type",
+    "coding_rate", "mod_order", "modulation", "tx_power_dbm", "digital_gain_db",
+    "ack_present", "cqi_present", "ri_present", "freq_hopping", "mirror_hopping",
+    "ue_srs", "srs_occasion", "num_ack_bits", "rate_matched_ack_bits", "ack_payload",
+    "num_ri_bits", "rate_matched_ri_bits", "ri_payload",
+    "num_cqi_bits", "rate_matched_cqi_bits", "num_dl_carriers", "drop_pusch",
+    "cyclic_shift_dmrs_slot0", "cyclic_shift_dmrs_slot1",
+    "start_rb_cluster1", "num_rb_cluster1",
+]
+
+B173_HEADER = [
+    "timestamp_epoch", "timestamp_utc", "frame", "subframe",
+    "num_rbs_subframe", "num_layers", "num_tbs_present", "hsic_enabled",
+    "tb_idx", "harq_id", "rv", "ndi", "crc_pass", "crc_status",
+    "rnti_type_id", "rnti_type", "tb_size_bytes", "tb_size_bits",
+    "mcs", "modulation", "tb_rbs", "did_recombining", "pmch_id", "area_id",
+]
+
 SCS_MAP = {0: "15kHz", 1: "30kHz", 2: "60kHz", 3: "120kHz"}
+
+B139_MODULATION_MAP = {
+    0: "BPSK",
+    1: "QPSK",
+    2: "16-QAM",
+    3: "64-QAM",
+    4: "256-QAM",
+}
+
+B173_RNTI_TYPE_MAP = {
+    0: "C-RNTI",
+    1: "RA-RNTI",
+    2: "P-RNTI",
+    3: "SI-RNTI",
+    4: "SPS / Temp C-RNTI",
+    5: "M-RNTI",
+}
+
+B173_MODULATION_MAP = {
+    2: "QPSK",
+    4: "16QAM",
+    6: "64QAM",
+    8: "256QAM",
+    0: "QPSK",
+    1: "16QAM",
+    3: "256QAM",
+}
 
 
 def u16(b, o):
@@ -245,6 +302,441 @@ def parse_b881_records(raw):
 
 
 # -----------------------------------------------------------------------------
+# B139 (LTE PHY PUSCH Tx Report) Parser
+# -----------------------------------------------------------------------------
+def parse_b139_records(raw):
+    """
+    Independently parses 0xB139 (LTE PHY PUSCH Tx Report) packets from raw bytes.
+    Supports versions v162/v145/v144 (100B), v124 (84B), v122 (68B), v102 (72B),
+    v43 (64B), v26 (52B), v24/v23 (48B).
+    """
+    records = []
+    i = 0
+    raw_len = len(raw)
+    while i < raw_len - 3:
+        if raw[i + 2] == 0x39 and raw[i + 3] == 0xB1:
+            pkt_len = raw[i] | (raw[i + 1] << 8)
+            if 20 <= pkt_len <= 4096 and i + pkt_len <= raw_len:
+                pkt_data = raw[i : i + pkt_len]
+                pkt_time = parse_qxdm_time(pkt_data[4:12])
+                payload = pkt_data[12:]
+                if len(payload) >= 8:
+                    version = payload[0]
+                    sc_raw = u16(payload, 1)
+                    serving_cell_id = sc_raw & 511
+                    num_records = (sc_raw >> 9) & 31
+                    disp_raw = u16(payload, 4)
+                    dispatch_sfn = disp_raw // 10
+                    dispatch_subfn = disp_raw % 10
+
+                    if version >= 144:
+                        rec_size = 100
+                    elif version == 124:
+                        rec_size = 84
+                    elif version == 122:
+                        rec_size = 68
+                    elif version == 102:
+                        rec_size = 72
+                    elif version == 43:
+                        rec_size = 64
+                    elif version == 26:
+                        rec_size = 52
+                    else:
+                        rec_size = 48
+
+                    header_offset = 8
+                    if 0 < num_records and header_offset + num_records * rec_size <= len(payload):
+                        for r_idx in range(num_records):
+                            rec_start = header_offset + (r_idx * rec_size)
+                            rec = payload[rec_start : rec_start + rec_size]
+
+                            sfn_sf = u16(rec, 0)
+                            current_sfn = sfn_sf // 10
+                            current_subfn = sfn_sf % 10
+
+                            if version >= 144:
+                                u2 = u16(rec, 2)
+                                ack_present = (u2 >> 2) & 1
+                                cqi_present = (u2 >> 3) & 1
+                                ri_present = (u2 >> 4) & 1
+                                freq_hopping = (u2 >> 5) & 3
+                                retx_index = (u2 >> 7) & 31
+                                rv = (u2 >> 12) & 3
+                                mirror_hopping = (u2 >> 14) & 3
+
+                                u4 = u32(rec, 4)
+                                resource_alloc_type = u4 & 1
+                                start_rb_slot0 = (u4 >> 1) & 127
+                                start_rb_slot1 = (u4 >> 8) & 127
+                                num_rb = (u4 >> 15) & 127
+
+                                tb_size_bytes = u16(rec, 8)
+                                coding_rate = round(u16(rec, 10) / 1024.0, 4)
+
+                                u12 = u32(rec, 12)
+                                rate_matched_ack_bits = u12 & 16383
+                                ri_payload_int = (u12 >> 14) & 16383
+                                ri_payload = f"0x{ri_payload_int:04x}"
+                                num_ri_bits = (u12 >> 28) & 15
+
+                                ack_payload = rec[16:32].hex()
+                                rate_matched_ri_bits = (u32(rec, 32) >> 14) & 0x7FF
+
+                                u36 = u32(rec, 36)
+                                ue_srs = u36 & 1
+                                srs_occasion = (u36 >> 1) & 1
+                                mod_order = (u36 >> 2) & 7
+                                digital_gain_db = (u36 >> 5) & 255
+                                start_rb_cluster1 = (u36 >> 13) & 127
+                                num_rb_cluster1 = (u36 >> 20) & 127
+
+                                u40 = u32(rec, 40)
+                                tx_power_dbm = u40 & 127
+                                num_cqi_bits = (u40 >> 7) & 255
+                                rate_matched_cqi_bits = (u40 >> 18) & 16383
+
+                                u44 = u32(rec, 44)
+                                num_dl_carriers = u44 & 3
+                                drop_pusch = (u44 >> 16) & 1
+
+                                u96 = u32(rec, 96)
+                                cyclic_shift_dmrs_slot0 = u96 & 15
+                                cyclic_shift_dmrs_slot1 = (u96 >> 4) & 15
+                                num_ack_bits = 0
+                            elif version in (102, 122, 124):
+                                u2 = u16(rec, 2)
+                                ack_present = (u2 >> 2) & 1
+                                cqi_present = (u2 >> 3) & 1
+                                ri_present = (u2 >> 4) & 1
+                                freq_hopping = (u2 >> 5) & 3
+                                retx_index = (u2 >> 7) & 31
+                                rv = (u2 >> 12) & 3
+                                mirror_hopping = (u2 >> 14) & 3
+
+                                u4 = u32(rec, 4)
+                                resource_alloc_type = (u4 & 1) if version != 122 else 0
+                                start_rb_slot0 = (u4 >> 1) & 127 if version != 122 else (u4 & 127)
+                                start_rb_slot1 = (u4 >> 8) & 127 if version != 122 else ((u4 >> 7) & 127)
+                                num_rb = (u4 >> 15) & 127 if version != 122 else ((u4 >> 14) & 127)
+
+                                tb_size_bytes = u16(rec, 8)
+                                coding_rate = round(u16(rec, 10) / 1024.0, 4)
+
+                                u12 = u32(rec, 12)
+                                rate_matched_ack_bits = u12 & 16383
+                                ri_payload_int = (u12 >> 14) & 15
+                                ri_payload = f"0x{ri_payload_int:x}"
+                                rate_matched_ri_bits = (u12 >> 18) & 2047
+                                ue_srs = (u12 >> 29) & 1
+                                srs_occasion = (u12 >> 30) & 1
+
+                                u16_val = u32(rec, 16)
+                                ack_payload = hex(u16_val & 0xFFFFF)
+                                num_ri_bits = (u16_val >> 28) & 7
+
+                                u20 = u32(rec, 20)
+                                mod_order = u20 & 3
+                                digital_gain_db = (u20 >> 2) & 255
+                                start_rb_cluster1 = (u20 >> 10) & 255 if version in (102, 124) else 0
+                                num_rb_cluster1 = (u20 >> 18) & 63 if version in (102, 124) else 0
+
+                                u24 = u32(rec, 24)
+                                tx_power_dbm = u24 & 127
+                                num_cqi_bits = (u24 >> 7) & 255
+                                rate_matched_cqi_bits = (u24 >> 15) & 65535
+
+                                u28 = u32(rec, 28)
+                                num_dl_carriers = u28 & 3
+                                drop_pusch = (u28 >> 16) & 1
+
+                                dmrs_offset = 64 if version == 102 else (60 if version == 122 else 76)
+                                if len(rec) >= dmrs_offset + 4:
+                                    udmrs = u32(rec, dmrs_offset)
+                                    cyclic_shift_dmrs_slot0 = udmrs & 15
+                                    cyclic_shift_dmrs_slot1 = (udmrs >> 4) & 15
+                                else:
+                                    cyclic_shift_dmrs_slot0 = 0
+                                    cyclic_shift_dmrs_slot1 = 0
+                                num_ack_bits = 0
+                            elif version == 43:
+                                coding_rate = round(u16(rec, 2) / 1024.0, 4)
+
+                                u4 = u32(rec, 4)
+                                ack_present = u4 & 1
+                                cqi_present = (u4 >> 1) & 1
+                                ri_present = (u4 >> 2) & 1
+                                freq_hopping = (u4 >> 3) & 3
+                                rv = (u4 >> 5) & 3
+                                mirror_hopping = (u4 >> 7) & 3
+                                cyclic_shift_dmrs_slot0 = (u4 >> 9) & 15
+                                cyclic_shift_dmrs_slot1 = (u4 >> 13) & 15
+                                ue_srs = (u4 >> 28) & 1
+
+                                u8 = u32(rec, 8)
+                                start_rb_slot0 = (u8 >> 11) & 127
+                                start_rb_slot1 = (u8 >> 18) & 127
+                                num_rb = (u8 >> 25) & 127
+
+                                tb_size_bytes = u16(rec, 12)
+                                ack_payload = hex(u32(rec, 14))
+
+                                u22 = u32(rec, 22)
+                                mod_order = u22 & 3
+                                digital_gain_db = 0
+
+                                srs_byte = rec[26]
+                                srs_occasion = srs_byte & 1
+                                retx_index = (srs_byte >> 1) & 31
+
+                                u28 = u32(rec, 28)
+                                tx_power_dbm = u28 & 1023
+                                num_cqi_bits = (u28 >> 10) & 255
+                                rate_matched_cqi_bits = (u28 >> 18) & 16383
+
+                                num_dl_carriers = u32(rec, 32) & 3
+                                resource_alloc_type = 0
+                                rate_matched_ack_bits = 0
+                                rate_matched_ri_bits = 0
+                                num_ri_bits = 0
+                                ri_payload = ""
+                                num_ack_bits = 0
+                                drop_pusch = 0
+                                start_rb_cluster1 = 0
+                                num_rb_cluster1 = 0
+                            else:
+                                coding_rate = round(u16(rec, 2) / 1024.0, 4)
+
+                                u4 = u32(rec, 4)
+                                ack_present = u4 & 1
+                                cqi_present = (u4 >> 1) & 1
+                                ri_present = (u4 >> 2) & 1
+                                freq_hopping = (u4 >> 3) & 3
+                                rv = (u4 >> 5) & 3
+                                mirror_hopping = (u4 >> 7) & 3
+                                cyclic_shift_dmrs_slot0 = (u4 >> 9) & 15
+                                cyclic_shift_dmrs_slot1 = (u4 >> 13) & 15
+                                ue_srs = (u4 >> 28) & 1
+
+                                u8 = u32(rec, 8)
+                                start_rb_slot0 = (u8 >> 11) & 127
+                                start_rb_slot1 = (u8 >> 18) & 127
+                                num_rb = (u8 >> 25) & 127
+
+                                tb_size_bytes = u16(rec, 12)
+
+                                u14 = u16(rec, 14)
+                                num_ack_bits = u14 & 7
+                                ack_payload = hex((u14 >> 3) & 15)
+
+                                u16_val = u32(rec, 16)
+                                rate_matched_ack_bits = u16_val & 2047
+                                num_ri_bits = (u16_val >> 11) & 3
+                                ri_payload = hex((u16_val >> 13) & 3)
+                                rate_matched_ri_bits = (u16_val >> 15) & 2047
+                                mod_order = (u16_val >> 26) & 3
+
+                                digital_gain_db = rec[20]
+                                u21 = rec[21]
+                                srs_occasion = u21 & 1
+                                retx_index = (u21 >> 1) & 31
+
+                                u24 = u32(rec, 24)
+                                tx_power_dbm = u24 & 1023
+                                num_cqi_bits = (u24 >> 10) & 255
+                                rate_matched_cqi_bits = (u24 >> 18) & 16383
+
+                                resource_alloc_type = 0
+                                num_dl_carriers = 1
+                                drop_pusch = 0
+                                start_rb_cluster1 = 0
+                                num_rb_cluster1 = 0
+
+                            mod_str = B139_MODULATION_MAP.get(mod_order, f"Mod_{mod_order}")
+                            tb_size_bits = tb_size_bytes * 8
+                            is_retx = 1 if retx_index > 0 else 0
+
+                            records.append({
+                                "time": pkt_time,
+                                "serving_cell_id": serving_cell_id,
+                                "dispatch_sfn": dispatch_sfn,
+                                "dispatch_subfn": dispatch_subfn,
+                                "current_sfn": current_sfn,
+                                "current_subfn": current_subfn,
+                                "retx_index": retx_index,
+                                "is_retx": is_retx,
+                                "rv": rv,
+                                "tb_size_bytes": tb_size_bytes,
+                                "tb_size_bits": tb_size_bits,
+                                "num_rb": num_rb,
+                                "start_rb_slot0": start_rb_slot0,
+                                "start_rb_slot1": start_rb_slot1,
+                                "resource_alloc_type": resource_alloc_type,
+                                "coding_rate": coding_rate,
+                                "mod_order": mod_order,
+                                "modulation": mod_str,
+                                "tx_power_dbm": tx_power_dbm,
+                                "digital_gain_db": digital_gain_db,
+                                "ack_present": ack_present,
+                                "cqi_present": cqi_present,
+                                "ri_present": ri_present,
+                                "freq_hopping": freq_hopping,
+                                "mirror_hopping": mirror_hopping,
+                                "ue_srs": ue_srs,
+                                "srs_occasion": srs_occasion,
+                                "num_ack_bits": num_ack_bits,
+                                "rate_matched_ack_bits": rate_matched_ack_bits,
+                                "ack_payload": ack_payload,
+                                "num_ri_bits": num_ri_bits,
+                                "rate_matched_ri_bits": rate_matched_ri_bits,
+                                "ri_payload": ri_payload,
+                                "num_cqi_bits": num_cqi_bits,
+                                "rate_matched_cqi_bits": rate_matched_cqi_bits,
+                                "num_dl_carriers": num_dl_carriers,
+                                "drop_pusch": drop_pusch,
+                                "cyclic_shift_dmrs_slot0": cyclic_shift_dmrs_slot0,
+                                "cyclic_shift_dmrs_slot1": cyclic_shift_dmrs_slot1,
+                                "start_rb_cluster1": start_rb_cluster1,
+                                "num_rb_cluster1": num_rb_cluster1,
+                            })
+                        i += pkt_len
+                        continue
+        i += 1
+    return records
+
+
+# -----------------------------------------------------------------------------
+# B173 (LTE ML1 PDSCH Stat Indication) Parser
+# -----------------------------------------------------------------------------
+def parse_b173_records(raw):
+    """
+    Independently parses 0xB173 (LTE ML1 PDSCH Stat Indication) packets from raw bytes.
+    Supports versions v48/v40/v37/v36 (40B), v34 (32B), v32/v24 (24B), v16/v5 (20B).
+    """
+    records = []
+    i = 0
+    raw_len = len(raw)
+    while i < raw_len - 3:
+        if raw[i + 2] == 0x73 and raw[i + 3] == 0xB1:
+            pkt_len = raw[i] | (raw[i + 1] << 8)
+            if 16 <= pkt_len <= 4096 and i + pkt_len <= raw_len:
+                pkt_data = raw[i : i + pkt_len]
+                pkt_time = parse_qxdm_time(pkt_data[4:12])
+                payload = pkt_data[12:]
+                if len(payload) >= 4:
+                    version = payload[0]
+                    num_records = payload[1]
+
+                    if version >= 36:
+                        rec_size = 40
+                        p1_size = 12
+                        tb_size = 12
+                    elif version == 34:
+                        rec_size = 32
+                        p1_size = 6
+                        tb_size = 12
+                    elif version in (32, 24):
+                        rec_size = 24
+                        p1_size = 6
+                        tb_size = 8
+                    else:
+                        rec_size = 20
+                        p1_size = 6
+                        tb_size = 6
+
+                    header_offset = 4
+                    if 0 < num_records and header_offset + num_records * rec_size <= len(payload):
+                        for r_idx in range(num_records):
+                            rec_start = header_offset + (r_idx * rec_size)
+                            rec = payload[rec_start : rec_start + rec_size]
+
+                            subfn_raw = u16(rec, 0)
+                            subframe = subfn_raw & 0xF
+                            frame = (subfn_raw >> 4) & 0xFFF
+                            num_rbs_subframe = rec[2]
+                            num_layers = rec[3]
+                            num_tbs_present = rec[4]
+                            cell_raw = rec[5]
+                            hsic_enabled = (cell_raw >> 3) & 0xF
+
+                            if version >= 36:
+                                pmch_id = rec[36]
+                                area_id = rec[37]
+                            else:
+                                pmch_id = rec[-2]
+                                area_id = rec[-1]
+
+                            actual_tb_count = min(num_tbs_present, 2)
+                            for tb_i in range(actual_tb_count):
+                                tb_offset = p1_size + (tb_i * tb_size)
+                                tb_bytes = rec[tb_offset : tb_offset + tb_size]
+
+                                harq_byte = tb_bytes[0]
+                                harq_id = harq_byte & 0xF
+                                rv = (harq_byte >> 4) & 0x3
+                                ndi = (harq_byte >> 6) & 0x1
+                                crc_pass = (harq_byte >> 7) & 0x1
+                                crc_str = "PASS" if crc_pass else "FAIL"
+
+                                if version >= 36:
+                                    rnti_word = u16(tb_bytes, 1)
+                                    rnti_type_id = rnti_word & 0xF
+                                    did_recombining = (rnti_word >> 10) & 0x1
+                                    tb_size_bytes = u16(tb_bytes, 4)
+                                    mcs = tb_bytes[6]
+                                    tb_rbs = tb_bytes[7]
+                                    mod_val = tb_bytes[8]
+                                elif version in (34, 32, 24):
+                                    rnti_byte = tb_bytes[1]
+                                    rnti_type_id = rnti_byte & 0xF
+                                    did_recombining = (rnti_byte >> 6) & 0x1
+                                    tb_size_bytes = u16(tb_bytes, 2) if version == 32 else u16(tb_bytes, 4)
+                                    mcs = tb_bytes[4] if version == 32 else tb_bytes[6]
+                                    tb_rbs = tb_bytes[5] if version == 32 else tb_bytes[7]
+                                    mod_val = tb_bytes[6] if version == 32 else tb_bytes[8]
+                                else:
+                                    rnti_type_id = tb_bytes[1] & 0xF
+                                    did_recombining = 0
+                                    tb_size_bytes = u16(tb_bytes, 2)
+                                    mcs = tb_bytes[4]
+                                    tb_rbs = tb_bytes[5]
+                                    mod_val = 0
+
+                                mod_str = B173_MODULATION_MAP.get(mod_val, f"Mod_{mod_val}")
+                                rnti_str = B173_RNTI_TYPE_MAP.get(rnti_type_id, f"RNTI_{rnti_type_id}")
+                                tb_size_bits = tb_size_bytes * 8
+
+                                records.append({
+                                    "time": pkt_time,
+                                    "frame": frame,
+                                    "subframe": subframe,
+                                    "num_rbs_subframe": num_rbs_subframe,
+                                    "num_layers": num_layers,
+                                    "num_tbs_present": num_tbs_present,
+                                    "hsic_enabled": hsic_enabled,
+                                    "tb_idx": tb_i,
+                                    "harq_id": harq_id,
+                                    "rv": rv,
+                                    "ndi": ndi,
+                                    "crc_pass": crc_pass,
+                                    "crc_status": crc_str,
+                                    "rnti_type_id": rnti_type_id,
+                                    "rnti_type": rnti_str,
+                                    "tb_size_bytes": tb_size_bytes,
+                                    "tb_size_bits": tb_size_bits,
+                                    "mcs": mcs,
+                                    "modulation": mod_str,
+                                    "tb_rbs": tb_rbs,
+                                    "did_recombining": did_recombining,
+                                    "pmch_id": pmch_id,
+                                    "area_id": area_id,
+                                })
+                        i += pkt_len
+                        continue
+        i += 1
+    return records
+
+
+# -----------------------------------------------------------------------------
 # Dump CSV Functions
 # -----------------------------------------------------------------------------
 def dump_b887(raw_bytes, out_csv):
@@ -374,6 +866,116 @@ def dump_b881(raw_bytes, out_csv):
     return len(rows)
 
 
+def dump_b139(raw_bytes, out_csv):
+    """
+    Decodes and writes B139 LTE PUSCH Tx records into out_csv sorted chronologically.
+    Always writes a valid CSV (header-only if no records exist).
+    """
+    records = parse_b139_records(raw_bytes)
+    records.sort(key=lambda r: (r["time"], r.get("current_sfn", 0), r.get("current_subfn", 0)))
+
+    with open(out_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(B139_HEADER)
+        for r in records:
+            writer.writerow([
+                f"{r['time']:.6f}",
+                human_time(r["time"]),
+                r["serving_cell_id"],
+                r["dispatch_sfn"],
+                r["dispatch_subfn"],
+                r["current_sfn"],
+                r["current_subfn"],
+                r["retx_index"],
+                r["is_retx"],
+                r["rv"],
+                r["tb_size_bytes"],
+                r["tb_size_bits"],
+                r["num_rb"],
+                r["start_rb_slot0"],
+                r["start_rb_slot1"],
+                r["resource_alloc_type"],
+                r["coding_rate"],
+                r["mod_order"],
+                r["modulation"],
+                r["tx_power_dbm"],
+                r["digital_gain_db"],
+                r["ack_present"],
+                r["cqi_present"],
+                r["ri_present"],
+                r["freq_hopping"],
+                r["mirror_hopping"],
+                r["ue_srs"],
+                r["srs_occasion"],
+                r["num_ack_bits"],
+                r["rate_matched_ack_bits"],
+                r["ack_payload"],
+                r["num_ri_bits"],
+                r["rate_matched_ri_bits"],
+                r["ri_payload"],
+                r["num_cqi_bits"],
+                r["rate_matched_cqi_bits"],
+                r["num_dl_carriers"],
+                r["drop_pusch"],
+                r["cyclic_shift_dmrs_slot0"],
+                r["cyclic_shift_dmrs_slot1"],
+                r["start_rb_cluster1"],
+                r["num_rb_cluster1"],
+            ])
+
+    if records:
+        print(f"  [B139] Wrote {len(records)} rows -> {out_csv}")
+    else:
+        print(f"  [B139] No records found (header-only CSV written: {out_csv})")
+    return len(records)
+
+
+def dump_b173(raw_bytes, out_csv):
+    """
+    Decodes and writes B173 LTE PDSCH Stat records into out_csv sorted chronologically.
+    Always writes a valid CSV (header-only if no records exist).
+    """
+    records = parse_b173_records(raw_bytes)
+    records.sort(key=lambda r: (r["time"], r.get("frame", 0), r.get("subframe", 0), r.get("tb_idx", 0)))
+
+    with open(out_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(B173_HEADER)
+        for r in records:
+            writer.writerow([
+                f"{r['time']:.6f}",
+                human_time(r["time"]),
+                r["frame"],
+                r["subframe"],
+                r["num_rbs_subframe"],
+                r["num_layers"],
+                r["num_tbs_present"],
+                r["hsic_enabled"],
+                r["tb_idx"],
+                r["harq_id"],
+                r["rv"],
+                r["ndi"],
+                r["crc_pass"],
+                r["crc_status"],
+                r["rnti_type_id"],
+                r["rnti_type"],
+                r["tb_size_bytes"],
+                r["tb_size_bits"],
+                r["mcs"],
+                r["modulation"],
+                r["tb_rbs"],
+                r["did_recombining"],
+                r["pmch_id"],
+                r["area_id"],
+            ])
+
+    if records:
+        print(f"  [B173] Wrote {len(records)} rows -> {out_csv}")
+    else:
+        print(f"  [B173] No records found (header-only CSV written: {out_csv})")
+    return len(records)
+
+
 # -----------------------------------------------------------------------------
 # Main CLI Entry Point
 # -----------------------------------------------------------------------------
@@ -410,6 +1012,20 @@ def main():
     except Exception:
         failed = True
         print("  [B887] ERROR while dumping B887 CSV:")
+        traceback.print_exc()
+
+    try:
+        dump_b139(raw_bytes, f"{out_prefix}_b139.csv")
+    except Exception:
+        failed = True
+        print("  [B139] ERROR while dumping B139 CSV:")
+        traceback.print_exc()
+
+    try:
+        dump_b173(raw_bytes, f"{out_prefix}_b173.csv")
+    except Exception:
+        failed = True
+        print("  [B173] ERROR while dumping B173 CSV:")
         traceback.print_exc()
 
     sys.exit(1 if failed else 0)

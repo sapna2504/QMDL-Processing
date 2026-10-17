@@ -29,7 +29,7 @@ plot_all_qmdl:
 			fi; \
 			if [ ! -f "$$dir/payloads.txt" ]; then \
 				echo "Extracting diagnostic payload bytes..."; \
- 				python3 $(MAKEFILE_DIR)qmdl_to_codes.py "$$dir/qmdl-to-scat.txt" "$$dir/payloads.txt"; \
+				python3 qmdl-to-code.py "$$dir/qmdl-to-scat.txt" "$$dir/payloads.txt"; \
 			fi; \
 			echo "Creating metrics csv..."; \
 			python3 dump_readable_logs.py $$dir/payloads.txt; \

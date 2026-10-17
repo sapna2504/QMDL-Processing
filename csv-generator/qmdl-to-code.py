@@ -11,7 +11,15 @@ payload = []
 
 with open(args.input, "r") as f, open(args.output, "w") as out:
     for line in f:
-        if ("Not parsing DIAG log item 0xb887" in line) or ("Not parsing DIAG log item 0xb881" in line):
+        if any(
+            code in line
+            for code in (
+                "Not parsing DIAG log item 0xb887",
+                "Not parsing DIAG log item 0xb881",
+                "Not parsing DIAG log item 0xb139",
+                "Not parsing DIAG log item 0xb173",
+            )
+        ):
             capture = True
             payload = []
             continue
